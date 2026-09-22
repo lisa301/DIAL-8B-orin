@@ -1,0 +1,11 @@
+./target/release/dial-cli \
+  --mode master \
+  --api 0.0.0.0:8082 \
+  --cpu \
+  --text-decode-mode cpu-only \
+  --video-max-frames 4 \
+  --video-fps 0 \
+  --video-min-frames 4 \
+  --video-batch-size 4 \
+  --video-max-side 64 \
+  --kv-cache-max-len 4096

@@ -1,0 +1,18 @@
+{
+  "prompt": "1+1等于多少？",
+  "input_ids": [
+    16,
+    10,
+    16,
+    107106,
+    100430,
+    11319
+  ],
+  "n_tokens": 6,
+  "hidden_size": 4096,
+  "embed_rms": 0.025198010727763176,
+  "raw_after_layer1_rms": 0.34038710594177246,
+  "final_norm_rms": 1.9932408332824707,
+  "final_norm_minus_raw_max_abs": 68.72398376464844,
+  "final_norm_minus_raw_rms": 1.8318928480148315
+}

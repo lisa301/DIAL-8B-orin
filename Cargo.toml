@@ -1,0 +1,24 @@
+[workspace]
+resolver = "2"
+members = ["dial-core", "dial-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+description = "Distributed LLM inference for mobile, desktop and server."
+repository = "https://github.com/evilsocket/spm"
+keywords = ["blas", "tensor", "machine-learning"]
+authors = ["Simone Margaritelli <evilsocket@gmail.com>"]
+license = "GPL-3.0"
+readme = "README.md"
+categories = ["science"]
+
+
+[profile.release]
+lto = true        # Enable link-time optimization
+codegen-units = 1 # Reduce number of codegen units to increase optimizations
+panic = 'abort'   # Abort on panic
+strip = true      # Strip symbols from binary*
+
+[patch.crates-io]
+rknpu2 = { path = "vendor/rknpu2" }

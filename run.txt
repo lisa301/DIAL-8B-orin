@@ -1,0 +1,62 @@
+
+
+
+
+
+
+
+
+
+cargo clean 清除缓存
+cargo build --release --features cuda  编译
+
+Qwen3-VL-8B-Instruct（本机示例）：
+  ./target/release/spm-cli --model /root/sdb/Qwen3-VL-8B-Instruct --api 0.0.0.0:8082 --topology topology_qwen3vl.yml
+  # 请求体支持多模态（base64）：
+  # curl http://127.0.0.1:8082/api/v1/chat/completions -H "Content-Type: application/json" -d '{"messages":[{"role":"user","content":[{"type":"text","text":"describe"},{"type":"image_base64","media_type":"image/png","data":"<BASE64>"}]}]}'
+
+服务器端执行指令：
+  ./target/release/spm-cli  --mode worker 
+  ./target/release/spm-cli  --mode worker --device 2  --address 0.0.0.0:10120
+
+
+
+在spm目录下：
+./target/release/spm-cli --model ../Meta-Llama-3-8B-Instruct  --mode worker --name worker0   --topology topology.yml  --address 0.0.0.0:10128  第一个设备的第一个terminal
+./target/release/spm-cli --model ../Meta-Llama-3-8B-Instruct  --mode worker --name worker1   --topology topology.yml  --address 0.0.0.0:10128  第二个设备的第一个terminal
+
+
+主节点运行：(谁运行该节点，谁用于访问，因为加载了)
+./target/release/spm-cli --model ../Meta-Llama-3-8B-Instruct --api 0.0.0.0:8082  --topology topology.yml   第二个设备的第二个terminal
+访问该系统：
+curl http://192.168.1.87:8082/api/v1/chat/completions  -H "Content-Type: application/json"  -d '{"messages": [{"role": "system", "content": "How are you?"}]}' 
+第二个设备的第三个terminal
+
+(0.0.0.0表示本机的所有ip地址，curl http://192.168.1.87:8080(或者使用换回地址127.0.0.1)指的是去访问该主节点的8080端口)
+
+结束进程：
+netstat -anp | grep 10128  查看端口
+kill -9 1012 
+
+
+windows命令：
+windows: 
+target\release\spm-cli.exe --model ../Meta-Llama-3-8B-Instruct --mode worker --name worker0 --topology topology.yml --address 0.0.0.0:10128
+windows：  
+target\release\spm-cli.exe --model ../Meta-Llama-3-8B-Instruct  --api 0.0.0.0:8080  --topology topology.yml
+windows：
+curl http://10.158.43.63:8080/api/v1/chat/completions -H "Content-Type: application/json" -d "{\"messages\": [{\"role\": \"system\", \"content\": \"How are you?\"}]}" 
+
+
+worker0:
+  host: '192.168.1.29:10128'
+  description: 'RK3588'
+  layers:
+    - 'model.layers.0-1'
+
+worker1:
+  host: '192.168.1.87:10128'
+  description: '87 server'
+  layers:
+    - 'model.layers.2-31'
+

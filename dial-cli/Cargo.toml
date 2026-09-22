@@ -1,0 +1,18 @@
+[package]
+name = "dial-cli"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0.86"
+dial-core = { path = "../dial-core" }
+# （新增）本地图片 -> base64，用于构造多模态请求体（image_base64）。
+base64 = "0.22.1"
+clap = "4.5.8"
+env_logger = "0.11.3"
+libc = "0.2.172"
+log = "0.4.27"
+serde_json = "1.0.140"
+tokio = { version = "1.38.0", features = ["full"] }
+# （新增）作为 HTTP 客户端调用 `--api` 暴露的 OpenAI 兼容接口，避免手写 curl/JSON。
+reqwest = { version = "0.12.12", default-features = false, features = ["json", "rustls-tls"] }

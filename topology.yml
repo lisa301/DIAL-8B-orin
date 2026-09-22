@@ -1,0 +1,6 @@
+worker0:
+  host: '192.168.1.87:10120'
+  description: '87 server'
+  layers:
+    - 'model.layers.0-31'
+    
