@@ -269,6 +269,11 @@ pub enum Message {
     },
     /// Worker->Master回传计算结果.
     Tensor { x: RawTensor, compute_us: u64 },
+    /// Worker-side sampling fast path: return only the sampled token id.
+    ///
+    /// This avoids wrapping a four-byte token in Tensor -> RawTensor and then
+    /// reconstructing a Tensor on the wire path.
+    SampledToken { token: u32, compute_us: u64 },
 }
 /// 给Message这个枚举，实现两个实用函数。
 impl Message {
@@ -312,6 +317,10 @@ impl Message {
 
     pub fn from_raw_tensor_with_compute(x: RawTensor, compute_us: u64) -> Self {
         Self::Tensor { x, compute_us }
+    }
+
+    pub fn sampled_token_with_compute(token: u32, compute_us: u64) -> Self {
+        Self::SampledToken { token, compute_us }
     }
 
     /// 创建批量计算任务消息
@@ -362,8 +371,14 @@ impl Message {
         bitcode::deserialize(raw).map_err(|e| anyhow!(e))
     }
 
-    /// 从网络流里读取一条完整的消息：先读校验码->读消息长度->读消息内容->反序列化成Message实例->返回.
-    pub async fn from_reader<R>(reader: &mut R) -> Result<(usize, Self)>
+    /// 从网络流里读取一条完整的消息，并复用调用方提供的缓冲区。
+    ///
+    /// Persistent Master/Worker connections invoke this once per generated token,
+    /// so reusing the allocation avoids a fresh Vec allocation on every RPC.
+    pub async fn from_reader_with_buffer<R>(
+        reader: &mut R,
+        buffer: &mut Vec<u8>,
+    ) -> Result<(usize, Self)>
     where
         R: AsyncReadExt + Unpin,
     {
@@ -377,12 +392,20 @@ impl Message {
         if req_size > super::MESSAGE_MAX_SIZE {
             return Err(anyhow!("request size {req_size} > MESSAGE_MAX_SIZE"));
         }
-        // 创建缓冲区，读取完整数据。
-        let mut req = vec![0_u8; req_size as usize];
 
-        reader.read_exact(&mut req).await?;
-        // 解析成消息并返回。
-        Ok((req.len(), Self::from_bytes(&req)?))
+        let req_size = req_size as usize;
+        buffer.resize(req_size, 0);
+        reader.read_exact(&mut buffer[..req_size]).await?;
+        Ok((req_size, Self::from_bytes(&buffer[..req_size])?))
+    }
+
+    /// Convenience wrapper for one-shot connections.
+    pub async fn from_reader<R>(reader: &mut R) -> Result<(usize, Self)>
+    where
+        R: AsyncReadExt + Unpin,
+    {
+        let mut buffer = Vec::new();
+        Self::from_reader_with_buffer(reader, &mut buffer).await
     }
 
     /// 把消息序列化成二进制->按照[魔数+长度+数据]的协议格式->发送到网络流
