@@ -325,6 +325,15 @@ impl<F: Forwarder> WorkerContext<F> {
     }
 }
 
+enum WorkerOps {
+    Named(Vec<(String, usize, usize)>),
+    Range {
+        index_pos: usize,
+        first_block_idx: usize,
+        num_layers: usize,
+    },
+}
+
 /// 定义结构体——工作节点.
 pub struct Worker<G: Generator> {
     listener: TcpListener,
@@ -668,33 +677,37 @@ impl<G: Generator + 'static> Worker<G> {
 
             /// 记录请求开始时间
             let (x, ops, sampling) = match op_message {
-                /// 单操作请求
                 Message::SingleOp {
                     layer_name,
                     x,
                     index_pos,
                     block_idx,
                     sampling,
-                } => (x, vec![(layer_name, index_pos, block_idx)], sampling),
-                /// 批量操作请求
-                Message::Batch { x, batch, sampling } => (x, batch, sampling),
+                } => (
+                    x,
+                    WorkerOps::Named(vec![(layer_name, index_pos, block_idx)]),
+                    sampling,
+                ),
+                Message::Batch { x, batch, sampling } => {
+                    (x, WorkerOps::Named(batch), sampling)
+                }
                 Message::CompactBatch { x, batch, sampling } => (
                     x,
-                    Self::expand_compact_batch(
+                    WorkerOps::Named(Self::expand_compact_batch(
                         batch.first_layer_name,
                         batch.index_pos,
                         batch.first_block_idx,
                         batch.num_layers,
-                    )?,
+                    )?),
                     sampling,
                 ),
                 Message::CompactRangeBatch { x, batch, sampling } => (
                     x,
-                    context.expand_compact_range_batch(
-                        batch.index_pos,
-                        batch.first_block_idx,
-                        batch.num_layers,
-                    )?,
+                    WorkerOps::Range {
+                        index_pos: batch.index_pos,
+                        first_block_idx: batch.first_block_idx,
+                        num_layers: batch.num_layers,
+                    },
                     sampling,
                 ),
                 _ => {
@@ -706,8 +719,46 @@ impl<G: Generator + 'static> Worker<G> {
                 }
             };
             let trace = Self::transfer_trace_enabled();
-            let ops_summary = trace.then(|| Self::ops_summary(&ops));
-            let final_request_block_idx = ops.last().map(|(_, _, block_idx)| *block_idx);
+            let num_ops = match &ops {
+                WorkerOps::Named(ops) => ops.len(),
+                WorkerOps::Range { num_layers, .. } => *num_layers,
+            };
+            let final_request_block_idx = match &ops {
+                WorkerOps::Named(ops) => ops.last().map(|(_, _, block_idx)| *block_idx),
+                WorkerOps::Range {
+                    first_block_idx,
+                    num_layers,
+                    ..
+                } => num_layers
+                    .checked_sub(1)
+                    .map(|last| first_block_idx.saturating_add(last)),
+            };
+            let ops_summary = if trace {
+                Some(match &ops {
+                    WorkerOps::Named(ops) => Self::ops_summary(ops),
+                    WorkerOps::Range {
+                        first_block_idx,
+                        num_layers,
+                        ..
+                    } => {
+                        let last_block_idx =
+                            first_block_idx.saturating_add(num_layers.saturating_sub(1));
+                        let first = context
+                            .block_names_by_idx
+                            .get(*first_block_idx)
+                            .and_then(Option::as_deref)
+                            .unwrap_or("-");
+                        let last = context
+                            .block_names_by_idx
+                            .get(last_block_idx)
+                            .and_then(Option::as_deref)
+                            .unwrap_or("-");
+                        format!("ops={} first={} last={}", num_layers, first, last)
+                    }
+                })
+            } else {
+                None
+            };
 
             // （新增）这里避免使用 `unwrap()`：
             // 为什么要加：一旦出现协议/数据不一致或 shape 错误，`unwrap()` 会直接 panic 把 worker 进程干掉；
@@ -719,29 +770,63 @@ impl<G: Generator + 'static> Worker<G> {
                 .to_tensor(&context.device)
                 .map_err(|e| anyhow!("[{}] could not decode tensor: {e}", &client))?;
             let decode_time = decode_start.elapsed();
-            /// 本次要执行的模型层数
-            let num_ops = ops.len();
-
-            // 遍历所有要执行的模型层
-            for (layer_name, index_pos, block_idx) in ops {
-                // 根据模型层名获取模型层
-                if let Some(block) = context.blocks.get(&layer_name) {
-                    // （新增）同样避免 `unwrap()`：把 layer/index_pos/block_idx 打进错误里，方便定位是哪一层/哪一步出错。
-                    // forward 前向传播
-                    x = block
-                        .forward(&x, index_pos, block_idx, &mut context.cache)
-                        .await
-                        .map_err(|e| {
-                            anyhow!(
-                                "[{}] forward failed for {} (index_pos={}, block_idx={}): {e}",
-                                &client,
-                                layer_name,
-                                index_pos,
-                                block_idx
-                            )
-                        })?;
-                } else {
-                    return Err(anyhow!("could not find layer {}", &layer_name));
+            // 遍历所有要执行的模型层。CompactRangeBatch 直接按 block index
+            // 访问，避免每个 token clone 一整组 layer-name String。
+            match ops {
+                WorkerOps::Named(ops) => {
+                    for (layer_name, index_pos, block_idx) in ops {
+                        let block = context
+                            .blocks
+                            .get(&layer_name)
+                            .ok_or_else(|| anyhow!("could not find layer {}", &layer_name))?;
+                        x = block
+                            .forward(&x, index_pos, block_idx, &mut context.cache)
+                            .await
+                            .map_err(|e| {
+                                anyhow!(
+                                    "[{}] forward failed for {} (index_pos={}, block_idx={}): {e}",
+                                    &client,
+                                    layer_name,
+                                    index_pos,
+                                    block_idx
+                                )
+                            })?;
+                    }
+                }
+                WorkerOps::Range {
+                    index_pos,
+                    first_block_idx,
+                    num_layers,
+                } => {
+                    for offset in 0..num_layers {
+                        let block_idx = first_block_idx.saturating_add(offset);
+                        let layer_name = context
+                            .block_names_by_idx
+                            .get(block_idx)
+                            .and_then(Option::as_deref)
+                            .ok_or_else(|| {
+                                anyhow!(
+                                    "compact range references missing local block index {}",
+                                    block_idx
+                                )
+                            })?;
+                        let block = context
+                            .blocks
+                            .get(layer_name)
+                            .ok_or_else(|| anyhow!("could not find layer {}", layer_name))?;
+                        x = block
+                            .forward(&x, index_pos, block_idx, &mut context.cache)
+                            .await
+                            .map_err(|e| {
+                                anyhow!(
+                                    "[{}] forward failed for {} (index_pos={}, block_idx={}): {e}",
+                                    &client,
+                                    layer_name,
+                                    index_pos,
+                                    block_idx
+                                )
+                            })?;
+                    }
                 }
             }
 
