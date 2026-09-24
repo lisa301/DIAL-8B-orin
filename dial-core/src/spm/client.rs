@@ -68,6 +68,7 @@ pub fn snapshot_distributed_profile() -> DistributedProfile {
 struct ClientConnection {
     stream: TcpStream,
     request_seq: u64,
+    read_buf: Vec<u8>,
 }
 
 /// A layer-specific view over one persistent worker connection.
@@ -160,10 +161,13 @@ impl Client {
     }
 
     fn transfer_trace_enabled() -> bool {
-        matches!(
-            std::env::var("SPM_TRACE_TRANSFER").ok().as_deref(),
-            Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES")
-        )
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            matches!(
+                std::env::var("SPM_TRACE_TRANSFER").ok().as_deref(),
+                Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES")
+            )
+        })
     }
 
     fn message_summary(message: &Message) -> String {
@@ -219,6 +223,11 @@ impl Client {
                 x.dtype,
                 *compute_us as f64 / 1000.0
             ),
+            Message::SampledToken { token, compute_us } => format!(
+                "sampled_token token={} compute={:.3}ms",
+                token,
+                *compute_us as f64 / 1000.0
+            ),
         }
     }
 
@@ -244,6 +253,7 @@ impl Client {
             connection: Arc::new(AsyncMutex::new(ClientConnection {
                 stream,
                 request_seq: 0,
+                read_buf: Vec::new(),
             })),
         };
 
@@ -282,36 +292,51 @@ impl Client {
         let mut connection = self.connection.lock().await;
         connection.request_seq += 1;
         let req_id = connection.request_seq;
-        let req_summary = Self::message_summary(&req);
+        let trace = Self::transfer_trace_enabled();
+        let req_summary = trace.then(|| Self::message_summary(&req));
         let total_start = Instant::now();
 
         let write_start = Instant::now();
         let written = req
             .to_writer(&mut connection.stream)
             .await
-            .map_err(|e| anyhow!("error sending {}: {}", req_summary, e))?;
+            .map_err(|e| anyhow!("error sending {}: {}", Self::message_summary(&req), e))?;
         let write_time = write_start.elapsed();
 
         let read_start = Instant::now();
-        let (read_size, msg) = super::Message::from_reader(&mut connection.stream)
-            .await
-            .map_err(|e| anyhow!("error receiving response for {}: {}", req_summary, e))?;
+        let (read_size, msg) = {
+            let ClientConnection {
+                stream, read_buf, ..
+            } = &mut *connection;
+            super::Message::from_reader_with_buffer(stream, read_buf)
+                .await
+                .map_err(|e| {
+                    anyhow!(
+                        "error receiving response for {}: {}",
+                        Self::message_summary(&req),
+                        e
+                    )
+                })?
+        };
         let read_time = read_start.elapsed();
         let total_time = total_start.elapsed();
 
-        if let (Ok(mut profile), Message::Tensor { compute_us, .. }) =
-            (distributed_profile().lock(), &msg)
-        {
+        let compute_us = match &msg {
+            Message::Tensor { compute_us, .. }
+            | Message::SampledToken { compute_us, .. } => Some(*compute_us),
+            _ => None,
+        };
+        if let (Ok(mut profile), Some(compute_us)) = (distributed_profile().lock(), compute_us) {
             profile.remote_requests += 1;
             profile.remote_total_s += total_time.as_secs_f64();
-            profile.remote_compute_s += *compute_us as f64 / 1_000_000.0;
+            profile.remote_compute_s += compute_us as f64 / 1_000_000.0;
             profile.remote_write_s += write_time.as_secs_f64();
             profile.remote_read_s += read_time.as_secs_f64();
             profile.remote_write_bytes += written;
             profile.remote_read_bytes += read_size;
         }
 
-        if Self::transfer_trace_enabled() {
+        if let Some(req_summary) = req_summary {
             log::info!(
                 "[transfer][client {}#{}] {} -> write={}B/{:.3}ms read={}B/{:.3}ms total={:.3}ms resp={}",
                 self.address,
@@ -332,6 +357,7 @@ impl Client {
         let resp = self.request(req).await?;
         match resp {
             Message::Tensor { x, .. } => Ok(x.to_tensor(&self.device)?),
+            Message::SampledToken { token, .. } => Ok(Tensor::new(&[token], &self.device)?),
             _ => Err(anyhow!("unexpected response {:?}", &resp)),
         }
     }
