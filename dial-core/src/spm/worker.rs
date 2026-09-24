@@ -334,10 +334,13 @@ pub struct Worker<G: Generator> {
 impl<G: Generator + 'static> Worker<G> {
     /// 判断是否开启传输跟踪日志
     fn transfer_trace_enabled() -> bool {
-        matches!(
-            std::env::var("SPM_TRACE_TRANSFER").ok().as_deref(),
-            Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES")
-        )
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            matches!(
+                std::env::var("SPM_TRACE_TRANSFER").ok().as_deref(),
+                Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES")
+            )
+        })
     }
     /// 生成操作统计摘要
     fn ops_summary(ops: &[(String, usize, usize)]) -> String {
@@ -583,14 +586,17 @@ impl<G: Generator + 'static> Worker<G> {
 
     /// Read a message from the socket and return elapsed time, message size and message.
     /// 异步网络工具函数，从socket读取消息并返回经过的时间、消息大小和消息。
-    async fn read_message_timed<R>(mut socket: R) -> Result<(Duration, usize, Message)>
+    async fn read_message_timed<R>(
+        socket: &mut R,
+        read_buf: &mut Vec<u8>,
+    ) -> Result<(Duration, usize, Message)>
     where
         // 这个函数能处理任何异步可读的数据流（TCP、管道、文件等）。
         R: AsyncReadExt + Unpin,
     {
         let start = Instant::now();
-        // 异步读取消息。
-        let (size, message) = Message::from_reader(&mut socket).await?;
+        // Reuse one allocation for the lifetime of the persistent connection.
+        let (size, message) = Message::from_reader_with_buffer(socket, read_buf).await?;
         let latency = start.elapsed();
 
         // 返回结果。
@@ -621,8 +627,10 @@ impl<G: Generator + 'static> Worker<G> {
         if let Err(e) = socket.set_nodelay(true) {
             log::warn!("[{}] failed to set TCP_NODELAY: {}", &client, e);
         }
+        let mut read_buf = Vec::new();
         // 读取Master发来的第一条消息，必须是Hello握手包
-        let (latency, _size, hello) = Self::read_message_timed(&mut socket).await?;
+        let (latency, _size, hello) =
+            Self::read_message_timed(&mut socket, &mut read_buf).await?;
         if !matches!(hello, Message::Hello) {
             return Err(anyhow!(
                 "[{}] unpexpected message instead of hello: {:?}",
@@ -650,7 +658,7 @@ impl<G: Generator + 'static> Worker<G> {
 
         // 持续读取消息
         while let Ok((read_time, read_size, op_message)) =
-            Self::read_message_timed(&mut socket).await
+            Self::read_message_timed(&mut socket, &mut read_buf).await
         {
             // Status probes stop after the Hello handshake. Allocate a fresh
             // KV cache only when this connection sends its first inference op.
@@ -697,7 +705,8 @@ impl<G: Generator + 'static> Worker<G> {
                     ));
                 }
             };
-            let ops_summary = Self::ops_summary(&ops);
+            let trace = Self::transfer_trace_enabled();
+            let ops_summary = trace.then(|| Self::ops_summary(&ops));
             let final_request_block_idx = ops.last().map(|(_, _, block_idx)| *block_idx);
 
             // （新增）这里避免使用 `unwrap()`：
@@ -736,30 +745,49 @@ impl<G: Generator + 'static> Worker<G> {
                 }
             }
 
-            if let Some(logits) = crate::models::qwen3_vl::maybe_forward_worker_gguf_output_head(
+            let mut sampled_token = None;
+            if let Some(output) = crate::models::qwen3_vl::maybe_forward_worker_gguf_output_head(
                 &x,
                 final_request_block_idx,
                 sampling.as_ref(),
             )
             .map_err(|e| anyhow!("[{}] worker GGUF output head failed: {e}", &client))?
             {
-                x = logits;
+                match output {
+                    crate::models::qwen3_vl::WorkerGgufOutput::Tensor(tensor) => x = tensor,
+                    crate::models::qwen3_vl::WorkerGgufOutput::SampledToken(token) => {
+                        sampled_token = Some(token)
+                    }
+                }
             }
 
-            // 发送推理结果张量。RawTensor 转换会触发 device-to-host 拷贝/同步，也属于远端侧耗时。
-            let response_tensor = super::RawTensor::from_tensor(&x)
-                .map_err(|e| anyhow!("[{}] could not encode response tensor: {e}", &client))?;
-            let compute_us = compute_start
-                .elapsed()
-                .as_micros()
-                .min(u128::from(u64::MAX)) as u64;
+            // Keep the sampled-token fast path scalar. For normal tensor responses,
+            // RawTensor conversion still performs the required device-to-host copy.
+            let (response_message, compute_us) = if let Some(token) = sampled_token {
+                let compute_us = compute_start
+                    .elapsed()
+                    .as_micros()
+                    .min(u128::from(u64::MAX)) as u64;
+                (
+                    Message::sampled_token_with_compute(token, compute_us),
+                    compute_us,
+                )
+            } else {
+                let response_tensor = super::RawTensor::from_tensor(&x)
+                    .map_err(|e| anyhow!("[{}] could not encode response tensor: {e}", &client))?;
+                let compute_us = compute_start
+                    .elapsed()
+                    .as_micros()
+                    .min(u128::from(u64::MAX)) as u64;
+                (
+                    Message::from_raw_tensor_with_compute(response_tensor, compute_us),
+                    compute_us,
+                )
+            };
             let elaps_ops = Duration::from_micros(compute_us);
             // 异步发送结果。
-            match Self::write_message_timed(
-                &mut socket,
-                Message::from_raw_tensor_with_compute(response_tensor, compute_us),
-            )
-            .await
+            match Self::write_message_timed(&mut socket, response_message)
+                .await
             {
                 Ok((elaps_write, written)) => {
                     // 发送成功：统计性能+打印日志。
@@ -771,7 +799,7 @@ impl<G: Generator + 'static> Worker<G> {
                     avg_write += write_bytes_per_sec;
                     avg_read += read_bytes_per_sec;
                     // 打印详细的日志。
-                    if Self::transfer_trace_enabled() {
+                    if let Some(ops_summary) = ops_summary.as_deref() {
                         log::info!(
                             "[transfer][worker {} msg={}] {} read={}B/{:.3}ms decode={:.3}ms compute={:.3}ms write={}B/{:.3}ms total={:.3}ms",
                             &client,
