@@ -30,6 +30,15 @@ struct WorkerGgufOutputHead {
     final_block_idx: usize,
 }
 
+/// Result of the optional Worker-side output-head path.
+///
+/// SampledToken keeps the fast path scalar all the way into the transport layer,
+/// avoiding Tensor -> RawTensor wrapping for a four-byte token id.
+pub enum WorkerGgufOutput {
+    Tensor(Tensor),
+    SampledToken(u32),
+}
+
 static WORKER_GGUF: OnceLock<RwLock<Option<Arc<WorkerGgufSource>>>> = OnceLock::new();
 static WORKER_GGUF_LINEAR_COUNT: AtomicUsize = AtomicUsize::new(0);
 static WORKER_GGUF_WEIGHT_BYTES: AtomicUsize = AtomicUsize::new(0);
@@ -343,7 +352,7 @@ pub fn maybe_forward_worker_gguf_output_head(
     x: &Tensor,
     final_request_block_idx: Option<usize>,
     sampling: Option<&crate::spm::SamplingRequest>,
-) -> candle_core::Result<Option<Tensor>> {
+) -> candle_core::Result<Option<WorkerGgufOutput>> {
     let head = output_head_slot()
         .read()
         .map_err(|_| candle_core::Error::Msg("worker GGUF output-head state poisoned".into()))?
@@ -380,9 +389,9 @@ pub fn maybe_forward_worker_gguf_output_head(
                 logits.dims()
             );
         }
-        return Ok(Some(Tensor::new(&[token], &Device::Cpu)?));
+        return Ok(Some(WorkerGgufOutput::SampledToken(token)));
     }
-    Ok(Some(logits))
+    Ok(Some(WorkerGgufOutput::Tensor(logits)))
 }
 
 pub fn worker_gguf_summary() -> Option<(usize, usize, usize, usize)> {
