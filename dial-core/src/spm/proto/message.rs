@@ -430,3 +430,23 @@ impl Message {
         Ok(8 + req.len())
     }
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::Message;
+
+    #[test]
+    fn sampled_token_roundtrip() {
+        let encoded = Message::sampled_token_with_compute(12345, 6789)
+            .to_bytes()
+            .unwrap();
+        match Message::from_bytes(&encoded).unwrap() {
+            Message::SampledToken { token, compute_us } => {
+                assert_eq!(token, 12345);
+                assert_eq!(compute_us, 6789);
+            }
+            other => panic!("unexpected decoded message: {other:?}"),
+        }
+    }
+}
